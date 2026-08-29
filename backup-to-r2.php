@@ -46,9 +46,15 @@ if (!is_dir($config['tmp_dir']) && !mkdir($config['tmp_dir'], 0700, true)) {
     fail_hard($config, $log, "Could not create tmp_dir: {$config['tmp_dir']}");
 }
 
-$canExec = function_exists('shell_exec') && !in_array('shell_exec', array_map('trim', explode(',', (string) ini_get('disable_functions'))), true);
-if (!$canExec) {
-    log_line($log, 'WARNING: shell_exec() is disabled on this host — database dumps will be SKIPPED. File backups will still run. Ask your host to enable shell_exec for mysqldump, or move databases to a host that allows it.');
+// A run that has to zip several hundred MB of files can take a few minutes.
+// If cron is (or gets accidentally left) firing more often than a run takes
+// to finish, this stops runs from stacking on top of each other and fighting
+// over CPU/bandwidth. The lock is held for as long as $lockHandle stays in
+// scope, i.e. until the script exits.
+$lockHandle = fopen(rtrim($config['tmp_dir'], '/') . '/backup.lock', 'c');
+if (!flock($lockHandle, LOCK_EX | LOCK_NB)) {
+    fwrite(STDERR, "Another backup run is still in progress — skipping this run.\n");
+    exit(0);
 }
 
 $producedFiles = [];
@@ -64,43 +70,94 @@ function dump_has_completed_marker(string $path): bool {
 }
 
 // ---- database dumps -------------------------------------------------------
+//
+// This host has shell_exec() disabled (common on cheap shared hosting), so
+// shelling out to the `mysqldump` binary isn't an option. Instead this dumps
+// each database straight over a PDO connection — schema via SHOW CREATE
+// TABLE, data via a streamed (unbuffered) SELECT * so a multi-GB table
+// doesn't get pulled entirely into memory. It does not dump stored
+// procedures/triggers (rare in Laravel apps, which keep schema in
+// migrations) — flag it if you rely on those.
 
-foreach ($config['databases'] as $db) {
-    if (!$canExec) {
-        break;
+function pdo_mysqldump(array $db, string $outputPath): ?string {
+    try {
+        $pdo = new PDO(
+            "mysql:host={$db['host']};dbname={$db['name']};charset=utf8mb4",
+            $db['user'],
+            $db['pass'],
+            [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => false,
+            ]
+        );
+    } catch (PDOException $e) {
+        return 'connection failed: ' . $e->getMessage();
     }
 
+    $fh = fopen($outputPath, 'wb');
+    fwrite($fh, "-- PHP-native dump of {$db['name']} on " . date('Y-m-d H:i:s') . "\n");
+    fwrite($fh, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n");
+
+    $tables = $pdo->query('SHOW FULL TABLES')->fetchAll(PDO::FETCH_NUM);
+
+    foreach ($tables as [$tableName, $tableType]) {
+        fwrite($fh, "\n-- ----------------------------\n-- {$tableName}\n-- ----------------------------\n");
+        fwrite($fh, "DROP TABLE IF EXISTS `{$tableName}`;\n");
+
+        $createRow = $pdo->query('SHOW CREATE TABLE `' . str_replace('`', '``', $tableName) . '`')->fetch(PDO::FETCH_NUM);
+        fwrite($fh, $createRow[1] . ";\n\n");
+
+        if ($tableType === 'VIEW') {
+            continue; // a view has no data of its own to dump
+        }
+
+        // A separate, still-unbuffered statement per table for the actual rows.
+        $stmt = $pdo->query('SELECT * FROM `' . str_replace('`', '``', $tableName) . '`');
+        $batch = [];
+        $columns = null;
+        $batchSize = 300;
+
+        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            $columns ??= array_keys($row);
+            $values = array_map(
+                fn($v) => $v === null ? 'NULL' : (is_int($v) || is_float($v) ? $v : $pdo->quote($v)),
+                $row
+            );
+            $batch[] = '(' . implode(',', $values) . ')';
+
+            if (count($batch) >= $batchSize) {
+                fwrite($fh, "INSERT INTO `{$tableName}` (`" . implode('`,`', $columns) . "`) VALUES\n" . implode(",\n", $batch) . ";\n");
+                $batch = [];
+            }
+        }
+        if (!empty($batch) && $columns !== null) {
+            fwrite($fh, "INSERT INTO `{$tableName}` (`" . implode('`,`', $columns) . "`) VALUES\n" . implode(",\n", $batch) . ";\n");
+        }
+    }
+
+    fwrite($fh, "\nSET FOREIGN_KEY_CHECKS=1;\n");
+    fwrite($fh, "-- Dump completed on " . date('Y-m-d H:i:s') . "\n");
+    fclose($fh);
+
+    return null; // success
+}
+
+foreach ($config['databases'] as $db) {
     $dumpFile = rtrim($config['tmp_dir'], '/') . "/{$db['name']}_{$runStamp}.sql";
     $gzFile   = $dumpFile . '.gz';
 
-    // Credentials file instead of --password on the CLI, so the password
-    // never appears in `ps aux` output (visible to other users on shared hosting).
-    $credFile = tempnam($config['tmp_dir'], 'mycnf_');
-    chmod($credFile, 0600);
-    file_put_contents($credFile, sprintf(
-        "[client]\nhost=%s\nuser=%s\npassword=%s\n",
-        $db['host'], $db['user'], $db['pass']
-    ));
+    $error = pdo_mysqldump($db, $dumpFile);
 
-    $cmd = sprintf(
-        'mysqldump --defaults-extra-file=%s --single-transaction --routines --triggers %s 2>&1',
-        escapeshellarg($credFile),
-        escapeshellarg($db['name'])
-    );
-
-    $output = shell_exec($cmd . ' > ' . escapeshellarg($dumpFile));
-    @unlink($credFile);
-
-    if (!is_file($dumpFile) || filesize($dumpFile) === 0) {
-        log_line($log, "ERROR: mysqldump produced no output for database '{$db['name']}'. Output: " . trim((string) $output));
+    if ($error !== null || !is_file($dumpFile) || filesize($dumpFile) === 0) {
+        log_line($log, "ERROR: dump failed for database '{$db['name']}'. " . ($error ?? 'no output produced'));
         @unlink($dumpFile);
         continue;
     }
 
-    // mysqldump only writes this exact line as the very last thing it does,
-    // after a clean finish. Its absence means the dump got cut off partway
-    // through (timeout, dropped DB connection, disk full, etc) — better to
-    // skip uploading it than to silently ship a broken backup.
+    // pdo_mysqldump() only writes this exact line as the very last thing it
+    // does, after a clean finish. Its absence means the dump got cut off
+    // partway through (timeout, dropped DB connection, disk full, etc) —
+    // better to skip uploading it than to silently ship a broken backup.
     if (!dump_has_completed_marker($dumpFile)) {
         log_line($log, "ERROR: dump for '{$db['name']}' looks truncated/incomplete (missing '-- Dump completed' marker) — NOT uploading it.");
         @unlink($dumpFile);
