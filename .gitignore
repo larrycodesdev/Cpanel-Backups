@@ -1,1 +1,6 @@
 backup-config.php
+.DS_Store
+*.log
+tmp/
+restored/
+backup.lock
